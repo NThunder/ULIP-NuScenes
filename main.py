@@ -35,9 +35,9 @@ def get_args_parser():
     parser = argparse.ArgumentParser(description='ULIP training and evaluation', add_help=False)
     # Data
     parser.add_argument('--output-dir', default='./outputs', type=str, help='output dir')
-    parser.add_argument('--pretrain_dataset_name', default='shapenet', type=str)
-    parser.add_argument('--pretrain_dataset_prompt', default='shapenet_64', type=str)
-    parser.add_argument('--validate_dataset_name', default='modelnet40', type=str)
+    parser.add_argument('--pretrain_dataset_name', default='nuscenes', type=str)
+    parser.add_argument('--pretrain_dataset_prompt', default='nuscenes_64', type=str)
+    parser.add_argument('--validate_dataset_name', default='nuscenes_val', type=str)
     parser.add_argument('--validate_dataset_prompt', default='modelnet40_64', type=str)
     parser.add_argument('--use_height', action='store_true', help='whether to use height informatio, by default enabled with PointNeXt.')
     parser.add_argument('--npoints', default=8192, type=int, help='number of points used for pre-train and test.')
@@ -88,6 +88,56 @@ def get_args_parser():
 best_acc1 = 0
 
 def main(args):
+    # Создадим экземпляр датасета без аугментаций для визуализации
+    # class Config1:
+    #     def __init__(self):
+    #         self.DATA_PATH = 'data/sets/mini/'
+    #         self.VERSION = 'v1.0-mini'
+    #         self.subset = 'train'
+    #         self.npoints = 1024
+    #         self.train_transform = None
+    #         self.augment = False
+    #         self.use_height = False
+    #         self.ratio = 1.0
+
+    # config1 = Config1()
+    # dataset = NuScenesDD(config1)
+
+    # # Возьмем первый элемент
+    # sample_token, instance_token, text, points, img, label = dataset[0]
+
+    # # 1. Визуализация изображения
+
+    # plt.figure(figsize=(10, 6))
+    # plt.imshow(img)  # Если img уже тензор, используйте img.permute(1, 2, 0).numpy()
+    # plt.title(f"Sample: {sample_token}\nCategory: {text}\nLabel: {label.item()}")
+    # plt.axis('off')
+    # plt.show()
+    # plt.imsave('img.jpeg', img)
+
+
+    # # 2. Визуализация облака точек
+
+    # fig = plt.figure(figsize=(10, 8))
+    # ax = fig.add_subplot(111, projection='3d')
+
+    # # Точки как numpy массив
+    # pts = points.numpy() if torch.is_tensor(points) else points
+    # ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1, c=pts[:, 0], cmap='viridis')
+
+    # ax.set_title(f"Point Cloud for {text}")
+    # ax.set_xlabel('X')
+    # ax.set_ylabel('Y')
+    # ax.set_zlabel('Z')
+    # plt.show()
+
+    # # 3. Вывод текстовой информации
+    # print("\nТекстовая информация:")
+    # print(f"Описание категории: {text}")
+    # print(f"Идентификатор экземпляра: {instance_token}")
+    # print(f"Числовой лейбл: {label.item()}")  
+    
+    
     utils.init_distributed_mode(args)
 
     global best_acc1
@@ -295,7 +345,9 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         texts = inputs[2]
 
         image = inputs[4]
-        inputs = [pc, texts, image]
+        # print("texts:   ", texts)
+        text_labels = inputs[5]
+        inputs = [pc, texts, image, text_labels]
 
         inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in inputs]
 
@@ -347,6 +399,18 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
             'logit_scale': logit_scale}
 
 
+def get_unique_embeddings(text_labels, text_embed):
+    labels_tensor = text_labels
+    
+    unique, idx, counts = torch.unique(labels_tensor, sorted=True, return_inverse=True, return_counts=True)
+    _, ind_sorted = torch.sort(idx, stable=True)
+    cum_sum = counts.cumsum(0)
+    cum_sum = torch.cat((torch.tensor([0], device=text_embed.device), cum_sum[:-1]))
+    first_indicies = ind_sorted[cum_sum]
+    
+    
+    return text_embed[first_indicies], idx
+
 def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
     batch_time = AverageMeter('Time', ':6.3f')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -365,64 +429,118 @@ def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
 
     if 'objaverse' in args.validate_dataset_name.lower():
         labels = test_loader.dataset.lvis_metadata['all_keys']
+    elif args.validate_dataset_name == 'nuscenes_val':
+        labels = None
     else:
         with open(os.path.join("./data", 'labels.json')) as f:
             labels = json.load(f)[args.validate_dataset_name]
 
     with torch.no_grad():
         text_features = []
-        for l in labels:
-            texts = [t.format(l) for t in templates]
-            texts = tokenizer(texts).cuda(args.gpu, non_blocking=True)
-            if len(texts.shape) < 2:
-                texts = texts[None, ...]
-            class_embeddings = utils.get_model(model).encode_text(texts)
-            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-            class_embeddings = class_embeddings.mean(dim=0)
-            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-            text_features.append(class_embeddings)
-        text_features = torch.stack(text_features, dim=0)
-
         end = time.time()
         per_class_stats = collections.defaultdict(int)
         per_class_correct_top1 = collections.defaultdict(int)
         per_class_correct_top5 = collections.defaultdict(int)
+        if labels is None:
+            for i, (pc, target, target_name) in enumerate(test_loader):
+                for name in target_name:
+                    per_class_stats[name] += 1
 
-        for i, (pc, target, target_name) in enumerate(test_loader):
-            for name in target_name:
-                per_class_stats[name] += 1
+                pc = pc.cuda(args.gpu, non_blocking=True)
+                target = target.cuda(args.gpu, non_blocking=True)
+                
+                pc_features = utils.get_model(model).encode_pc(pc)
+                pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+                
+           
+                for l in target_name:
+                    
+                    tokenized_text = tokenizer(l).cuda(args.gpu, non_blocking=True)
+                    texts = torch.stack([tokenized_text])
+                    
+                    if len(texts.shape) < 2:
+                        texts = texts[None, ...]
+                    class_embeddings = utils.get_model(model).encode_text(texts)
+                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                    class_embeddings = class_embeddings.mean(dim=0)
+                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                    text_features.append(class_embeddings)
+                text_features = torch.stack(text_features, dim=0)
+                
+                unique_text_embed, indices = get_unique_embeddings(target, text_features)
+                
+                logits_per_pc = pc_features @ unique_text_embed.t()
 
-            pc = pc.cuda(args.gpu, non_blocking=True)
-            target = target.cuda(args.gpu, non_blocking=True)
 
-            # encode pc
-            pc_features = utils.get_model(model).encode_pc(pc)
-            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+                (acc1, acc5), correct = accuracy(logits_per_pc, indices, topk=(1, 5))
+                # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1.update(acc1.item(), pc.size(0))
+                top5.update(acc5.item(), pc.size(0))
 
-            # cosine similarity as logits
-            logits_per_pc = pc_features @ text_features.t()
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
 
-            # measure accuracy and record loss
-            (acc1, acc5), correct = accuracy(logits_per_pc, target, topk=(1, 5))
-            # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
-            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-            top1.update(acc1.item(), pc.size(0))
-            top5.update(acc5.item(), pc.size(0))
+                top1_accurate = correct[:1].squeeze()
+                top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
+                for idx, name in enumerate(target_name):
+                    if top1_accurate[idx].item():
+                        per_class_correct_top1[name] += 1
+                    if top5_accurate[idx].item():
+                        per_class_correct_top5[name] += 1
 
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
+                if i % args.print_freq == 0:
+                    progress.display(i)
+                
+        else:
+            for l in labels:
+                texts = [t.format(l) for t in templates]
+                texts = tokenizer(texts).cuda(args.gpu, non_blocking=True)
+                if len(texts.shape) < 2:
+                    texts = texts[None, ...]
+                class_embeddings = utils.get_model(model).encode_text(texts)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                class_embeddings = class_embeddings.mean(dim=0)
+                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+                text_features.append(class_embeddings)
+            text_features = torch.stack(text_features, dim=0)
 
-            top1_accurate = correct[:1].squeeze()
-            top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
-            for idx, name in enumerate(target_name):
-                if top1_accurate[idx].item():
-                    per_class_correct_top1[name] += 1
-                if top5_accurate[idx].item():
-                    per_class_correct_top5[name] += 1
+            for i, (pc, target, target_name) in enumerate(test_loader):
+                for name in target_name:
+                    per_class_stats[name] += 1
 
-            if i % args.print_freq == 0:
-                progress.display(i)
+                pc = pc.cuda(args.gpu, non_blocking=True)
+                target = target.cuda(args.gpu, non_blocking=True)
+
+                # encode pc
+                pc_features = utils.get_model(model).encode_pc(pc)
+                pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+
+                # cosine similarity as logits
+                logits_per_pc = pc_features @ text_features.t()
+
+                # measure accuracy and record loss
+                (acc1, acc5), correct = accuracy(logits_per_pc, target, topk=(1, 5))
+                # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
+                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+                top1.update(acc1.item(), pc.size(0))
+                top5.update(acc5.item(), pc.size(0))
+
+                # measure elapsed time
+                batch_time.update(time.time() - end)
+                end = time.time()
+
+                top1_accurate = correct[:1].squeeze()
+                top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
+                for idx, name in enumerate(target_name):
+                    if top1_accurate[idx].item():
+                        per_class_correct_top1[name] += 1
+                    if top5_accurate[idx].item():
+                        per_class_correct_top5[name] += 1
+
+                if i % args.print_freq == 0:
+                    progress.display(i)
 
         top1_accuracy_per_class = {}
         top5_accuracy_per_class = {}
@@ -432,9 +550,9 @@ def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
 
         top1_accuracy_per_class = collections.OrderedDict(top1_accuracy_per_class)
         top5_accuracy_per_class = collections.OrderedDict(top5_accuracy_per_class)
-        # print(','.join(top1_accuracy_per_class.keys()))
-        # print(','.join([str(value) for value in top1_accuracy_per_class.values()]))
-        # print(','.join([str(value) for value in top5_accuracy_per_class.values()]))
+            # print(','.join(top1_accuracy_per_class.keys()))
+            # print(','.join([str(value) for value in top1_accuracy_per_class.values()]))
+            # print(','.join([str(value) for value in top5_accuracy_per_class.values()]))
 
     progress.synchronize()
     print('0-shot * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}')
@@ -557,7 +675,7 @@ def accuracy(output, target, topk=(1,)):
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
-
+        print("(output.shape:   ", output.shape, target.shape, maxk)
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
         correct = pred.eq(target.reshape(1, -1).expand_as(pred))
@@ -568,9 +686,13 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res, correct
 
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ULIP training and evaluation', parents=[get_args_parser()])
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+      
+    
     main(args)

@@ -148,11 +148,12 @@ class ULIP_WITH_IMAGE(nn.Module):
         pc_embed = pc_feat @ self.pc_projection
         return pc_embed
 
-    def forward(self, pc, text, image=None):
+    def forward(self, pc, text, image=None, text_labels=None):
 
         text_embed_all = []
         for i in range(text.shape[0]):
             text_for_one_sample = text[i]
+            # print("text_for_one_sample: ", text_for_one_sample)
             text_embed = self.encode_text(text_for_one_sample)
             text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
             text_embed = text_embed.mean(dim=0)
@@ -161,7 +162,14 @@ class ULIP_WITH_IMAGE(nn.Module):
 
         text_embed_all = torch.stack(text_embed_all)
         pc_embed = self.encode_pc(pc)
-        if image is not None:
+        if image is not None and text_labels is not None:
+            image_embed = self.encode_image(image)
+            return {'text_embed': text_embed_all,
+                    'pc_embed': pc_embed,
+                    'image_embed': image_embed,
+                    'logit_scale': self.logit_scale.exp(),
+                    'text_labels': text_labels}
+        elif image is not None:
             image_embed = self.encode_image(image)
             return {'text_embed': text_embed_all,
                     'pc_embed': pc_embed,
