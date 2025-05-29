@@ -24,7 +24,7 @@ def get_unique_embeddings(text_labels, text_embed):
 
     # print("first_indicies:  ", text_labels, unique, first_indicies)
     
-    return text_embed[first_indicies], idx
+    return text_embed[first_indicies], idx, counts
 
 class ULIPWithImageLoss(nn.Module):
     def __init__(self):
@@ -56,7 +56,7 @@ class ULIPWithImageLoss(nn.Module):
             utils.all_gather_batch([pc_embed, text_embed, image_embed])
             
 
-        unique_text_embed, indices = get_unique_embeddings(text_labels, text_embed)
+        unique_text_embed, indices, counts = get_unique_embeddings(text_labels, text_embed)
 
         logits_per_pc_text = logit_scale * pc_embed_all @ unique_text_embed.t()  # [batch, global_num_unique]
 
@@ -66,8 +66,10 @@ class ULIPWithImageLoss(nn.Module):
         # logits_per_text_pc = logit_scale * text_embed @ pc_embed_all.t()
         logits_per_pc_image = logit_scale * pc_embed @ image_embed_all.t()
         logits_per_image_pc = logit_scale * image_embed @ pc_embed_all.t()
+        
+        class_weights = 1.0 / counts
 
-        loss =  F.cross_entropy(logits_per_pc_text, indices.to(pc_embed.device)) + \
+        loss =  F.cross_entropy(logits_per_pc_text, indices.to(pc_embed.device), weight=class_weights) + \
                 (F.cross_entropy(logits_per_pc_image, self.labels) + F.cross_entropy(logits_per_image_pc, self.labels)) / 2
 
         # compute accuracy

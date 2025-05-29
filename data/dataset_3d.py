@@ -697,11 +697,12 @@ class NuScenesTest(data.Dataset):
         
 
         if self.ratio < 1.0:
-            self.annotations_points = self.annotations_points[-int(self.ratio * len(self.annotations_points)):]
-            self.labels_name = self.labels_name[-int(self.ratio * len(self.labels_name)):]
-            self.labels = self.labels[-int(self.ratio * len(self.labels)):]
+            self.annotations_points = self.annotations_points[:int(self.ratio * len(self.annotations_points))]
+            self.labels_name = self.labels_name[:int(self.ratio * len(self.labels_name))]
+            self.labels = self.labels[:int(self.ratio * len(self.labels))]
         
         self.permutation = np.arange(self.npoints)
+        print("self.npoints:    ", self.npoints)
         self.uniform = config.get('uniform', True)
         self.augment = config.get('augment', True)
 
@@ -746,8 +747,6 @@ class NuScenesTest(data.Dataset):
             points = self._pad_points(points, self.npoints)
         if self.uniform and self.npoints < points.shape[0]:
             points = farthest_point_sample(points, self.npoints)
-        else:
-            points = self.random_sample(points, self.npoints)
         points = self.pc_norm(points)
 
         points = torch.from_numpy(points).float()
@@ -964,8 +963,6 @@ class NuScenesCropDataset(data.Dataset):
             points = self._pad_points(points_in_box1, self.npoints)
         if self.uniform and self.npoints < points.shape[0]:
             points = farthest_point_sample(points, self.npoints)
-        else:
-            points = self.random_sample(points, self.npoints)
         points = self.pc_norm(points)
 
         if self.augment:

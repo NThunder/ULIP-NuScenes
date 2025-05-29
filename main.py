@@ -411,6 +411,8 @@ def get_unique_embeddings(text_labels, text_embed):
     
     return text_embed[first_indicies], idx
 
+import torch.nn.functional as F
+
 def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
     batch_time = AverageMeter('Time', ':6.3f')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -429,118 +431,62 @@ def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
 
     if 'objaverse' in args.validate_dataset_name.lower():
         labels = test_loader.dataset.lvis_metadata['all_keys']
-    elif args.validate_dataset_name == 'nuscenes_val':
-        labels = None
     else:
         with open(os.path.join("./data", 'labels.json')) as f:
             labels = json.load(f)[args.validate_dataset_name]
 
+    m_lab = {item: idx for idx, item in enumerate(labels)}
+    
     with torch.no_grad():
         text_features = []
         end = time.time()
         per_class_stats = collections.defaultdict(int)
         per_class_correct_top1 = collections.defaultdict(int)
         per_class_correct_top5 = collections.defaultdict(int)
-        if labels is None:
-            for i, (pc, target, target_name) in enumerate(test_loader):
-                for name in target_name:
-                    per_class_stats[name] += 1
 
-                pc = pc.cuda(args.gpu, non_blocking=True)
-                target = target.cuda(args.gpu, non_blocking=True)
+        texts = tokenizer(labels).cuda(args.gpu, non_blocking=True)
+        class_embeddings = utils.get_model(model).encode_text(texts)
+        text_features = F.normalize(class_embeddings, dim=-1, p=2)
+
+        for i, (pc, target, target_name) in enumerate(test_loader):
+            for name in target_name:
+                per_class_stats[name] += 1
                 
-                pc_features = utils.get_model(model).encode_pc(pc)
-                pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
-                
-           
-                for l in target_name:
-                    
-                    tokenized_text = tokenizer(l).cuda(args.gpu, non_blocking=True)
-                    texts = torch.stack([tokenized_text])
-                    
-                    if len(texts.shape) < 2:
-                        texts = texts[None, ...]
-                    class_embeddings = utils.get_model(model).encode_text(texts)
-                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                    class_embeddings = class_embeddings.mean(dim=0)
-                    class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                    text_features.append(class_embeddings)
-                text_features = torch.stack(text_features, dim=0)
-                
-                unique_text_embed, indices = get_unique_embeddings(target, text_features)
-                
-                logits_per_pc = pc_features @ unique_text_embed.t()
+            my_target = []
+            for t in target_name:
+                my_target.append(m_lab[t])
 
+            pc = pc.cuda(args.gpu, non_blocking=True)
+            my_target = torch.tensor(my_target).cuda(args.gpu, non_blocking=True)
 
-                (acc1, acc5), correct = accuracy(logits_per_pc, indices, topk=(1, 5))
-                # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
-                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-                top1.update(acc1.item(), pc.size(0))
-                top5.update(acc5.item(), pc.size(0))
+            # encode pc
+            pc_features = utils.get_model(model).encode_pc(pc)
+            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
 
-                # measure elapsed time
-                batch_time.update(time.time() - end)
-                end = time.time()
+            # cosine similarity as logits
+            logits_per_pc = pc_features @ text_features.t()
 
-                top1_accurate = correct[:1].squeeze()
-                top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
-                for idx, name in enumerate(target_name):
-                    if top1_accurate[idx].item():
-                        per_class_correct_top1[name] += 1
-                    if top5_accurate[idx].item():
-                        per_class_correct_top5[name] += 1
+            # measure accuracy and record loss
+            (acc1, acc5), correct = accuracy(logits_per_pc, my_target, topk=(1, 5))
+            # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
+            acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
+            top1.update(acc1.item(), pc.size(0))
+            top5.update(acc5.item(), pc.size(0))
 
-                if i % args.print_freq == 0:
-                    progress.display(i)
-                
-        else:
-            for l in labels:
-                texts = [t.format(l) for t in templates]
-                texts = tokenizer(texts).cuda(args.gpu, non_blocking=True)
-                if len(texts.shape) < 2:
-                    texts = texts[None, ...]
-                class_embeddings = utils.get_model(model).encode_text(texts)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                class_embeddings = class_embeddings.mean(dim=0)
-                class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
-                text_features.append(class_embeddings)
-            text_features = torch.stack(text_features, dim=0)
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-            for i, (pc, target, target_name) in enumerate(test_loader):
-                for name in target_name:
-                    per_class_stats[name] += 1
+            top1_accurate = correct[:1].squeeze()
+            top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
+            for idx, name in enumerate(target_name):
+                if top1_accurate[idx].item():
+                    per_class_correct_top1[name] += 1
+                if top5_accurate[idx].item():
+                    per_class_correct_top5[name] += 1
 
-                pc = pc.cuda(args.gpu, non_blocking=True)
-                target = target.cuda(args.gpu, non_blocking=True)
-
-                # encode pc
-                pc_features = utils.get_model(model).encode_pc(pc)
-                pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
-
-                # cosine similarity as logits
-                logits_per_pc = pc_features @ text_features.t()
-
-                # measure accuracy and record loss
-                (acc1, acc5), correct = accuracy(logits_per_pc, target, topk=(1, 5))
-                # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
-                acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
-                top1.update(acc1.item(), pc.size(0))
-                top5.update(acc5.item(), pc.size(0))
-
-                # measure elapsed time
-                batch_time.update(time.time() - end)
-                end = time.time()
-
-                top1_accurate = correct[:1].squeeze()
-                top5_accurate = correct[:5].float().sum(0, keepdim=True).squeeze()
-                for idx, name in enumerate(target_name):
-                    if top1_accurate[idx].item():
-                        per_class_correct_top1[name] += 1
-                    if top5_accurate[idx].item():
-                        per_class_correct_top5[name] += 1
-
-                if i % args.print_freq == 0:
-                    progress.display(i)
+            if i % args.print_freq == 0:
+                progress.display(i)
 
         top1_accuracy_per_class = {}
         top5_accuracy_per_class = {}
@@ -675,7 +621,6 @@ def accuracy(output, target, topk=(1,)):
     with torch.no_grad():
         maxk = max(topk)
         batch_size = target.size(0)
-        print("(output.shape:   ", output.shape, target.shape, maxk)
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
         correct = pred.eq(target.reshape(1, -1).expand_as(pred))

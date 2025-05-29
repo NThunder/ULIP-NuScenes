@@ -40,5 +40,20 @@
         "vase",
         "wardrobe",
         "xbox"
+    ],
+    "nuscenes_val": [
+        "pedestrian",
+        "car",
+        "trafficcone",
+        "bicycle",
+        "barrier",
+        "truck",
+        "bus",
+        "construction",
+        "pushable_pullable",
+        "motorcycle",
+        "debris",
+        "bicycle_rack",
+        "trailer"
     ]
 }

@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node=1 main.py --model ULIP_PN_SSG --npoints 512 --lr 3e-3 --output-dir ./outputs/reproduce_pointnet2_ssg_8kpts_nuscanes_new_loss_val
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.launch --nproc_per_node=1 main.py --model ULIP_PN_SSG --npoints 512 --lr 3e-3 --output-dir ./outputs/reproduce_pointnet2_ssg_8kpts_nuscanes_new_loss_train_wr
