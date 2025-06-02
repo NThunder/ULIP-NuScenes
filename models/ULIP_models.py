@@ -161,6 +161,7 @@ class ULIP_WITH_IMAGE(nn.Module):
             text_embed_all.append(text_embed)
 
         text_embed_all = torch.stack(text_embed_all)
+        # print("text_embed_all:  ", text_embed_all.shape)
         pc_embed = self.encode_pc(pc)
         if image is not None and text_labels is not None:
             image_embed = self.encode_image(image)

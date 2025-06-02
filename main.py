@@ -343,6 +343,8 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
 
         pc = inputs[3]
         texts = inputs[2]
+        
+        # print("train_texts: ", texts.shape)
 
         image = inputs[4]
         # print("texts:   ", texts)
@@ -413,6 +415,21 @@ def get_unique_embeddings(text_labels, text_embed):
 
 import torch.nn.functional as F
 
+def get_unique_embeddings(text_labels, text_embed):
+    labels_tensor = text_labels
+    
+    unique, idx, counts = torch.unique(labels_tensor, sorted=True, return_inverse=True, return_counts=True)
+    _, ind_sorted = torch.sort(idx, stable=True)
+    cum_sum = counts.cumsum(0)
+    cum_sum = torch.cat((torch.tensor([0], device=text_embed.device), cum_sum[:-1]))
+    first_indicies = ind_sorted[cum_sum]
+    
+    # Извлекаем эмбеддинги
+
+    # print("first_indicies:  ", text_labels, unique, first_indicies)
+    
+    return text_embed[first_indicies], idx, counts
+
 def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
     batch_time = AverageMeter('Time', ':6.3f')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -443,12 +460,31 @@ def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
         per_class_stats = collections.defaultdict(int)
         per_class_correct_top1 = collections.defaultdict(int)
         per_class_correct_top5 = collections.defaultdict(int)
+        
+        tokenized_captions2 = []
+        for l in labels:
+            tokenized_captions = []
+            tokenized_captions.append(tokenizer(l))
+            tokenized_captions = torch.stack(tokenized_captions)
+            tokenized_captions2.append(tokenized_captions)
+        tokenized_captions2 = torch.stack(tokenized_captions2).cuda(args.gpu, non_blocking=True)
+        
+        print("tokenized_captions2: ", tokenized_captions2.shape)
+        
+        text_embed_all = []
+        for i in range(tokenized_captions2.shape[0]):
+            text_for_one_sample = tokenized_captions2[i]
+            # print("text_for_one_sample: ", text_for_one_sample)
+            text_embed = utils.get_model(model).encode_text(text_for_one_sample)
+            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+            text_embed = text_embed.mean(dim=0)
+            text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+            text_embed_all.append(text_embed)
 
-        texts = tokenizer(labels).cuda(args.gpu, non_blocking=True)
-        class_embeddings = utils.get_model(model).encode_text(texts)
-        text_features = F.normalize(class_embeddings, dim=-1, p=2)
-
-        for i, (pc, target, target_name) in enumerate(test_loader):
+        text_embed_all = torch.stack(text_embed_all)
+        text_features = F.normalize(text_embed_all, dim=-1, p=2)
+        
+        for i, (pc, target, target_name, text_embs) in enumerate(test_loader):
             for name in target_name:
                 per_class_stats[name] += 1
                 
@@ -461,13 +497,14 @@ def test_zeroshot_3d_core(test_loader, model, tokenizer, args=None):
 
             # encode pc
             pc_features = utils.get_model(model).encode_pc(pc)
-            pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+            # pc_features = pc_features / pc_features.norm(dim=-1, keepdim=True)
+            pc_features = F.normalize(pc_features, dim=-1, p=2)
 
             # cosine similarity as logits
             logits_per_pc = pc_features @ text_features.t()
 
             # measure accuracy and record loss
-            (acc1, acc5), correct = accuracy(logits_per_pc, my_target, topk=(1, 5))
+            (acc1, acc5), correct = accuracy(logits_per_pc, my_target, topk=(1, 3))
             # TODO: fix the all reduce for the correct variable, assuming only one process for evaluation!
             acc1, acc5 = utils.scaled_all_reduce([acc1, acc5])
             top1.update(acc1.item(), pc.size(0))

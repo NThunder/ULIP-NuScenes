@@ -663,6 +663,7 @@ class NuScenesTest(data.Dataset):
         self.annotations_points = []
         self.labels_name = []
         self.labels = []
+        self.boxes =[]
 
         for sample in self.nusc.sample:
 
@@ -691,15 +692,16 @@ class NuScenesTest(data.Dataset):
                 mask = points_in_box(box, pc.points[:3, :])
                 points = pc.points[:3, mask].T
                 if points.shape[0] > 100:
+                    self.boxes.append(box)
                     self.annotations_points.append(points)
                     self.labels_name.append(caption)
                     self.labels.append(torch.tensor(self.category_to_index[category_name]))
         
 
         if self.ratio < 1.0:
-            self.annotations_points = self.annotations_points[:int(self.ratio * len(self.annotations_points))]
-            self.labels_name = self.labels_name[:int(self.ratio * len(self.labels_name))]
-            self.labels = self.labels[:int(self.ratio * len(self.labels))]
+            self.annotations_points = self.annotations_points[-1 * int(self.ratio * len(self.annotations_points)):]
+            self.labels_name = self.labels_name[-1 * int(self.ratio * len(self.labels_name)):]
+            self.labels = self.labels[-1 * int(self.ratio * len(self.labels)):]
         
         self.permutation = np.arange(self.npoints)
         print("self.npoints:    ", self.npoints)
@@ -708,11 +710,15 @@ class NuScenesTest(data.Dataset):
 
 
     def pc_norm(self, pc):
-        """ Normalize point cloud """
         centroid = np.mean(pc, axis=0)
         pc = pc - centroid
         m = np.max(np.sqrt(np.sum(pc ** 2, axis=1)))
-        pc = pc / m
+        if np.isclose(m, 0) or np.isnan(m):
+            # Если все точки совпадают с центром или m=NaN
+            return np.zeros_like(pc)
+        
+        # 4. Безопасная нормализация
+        pc = pc / (m + 1e-10)  # Добавляем малую константу для стабильности
         return pc
 
     def random_sample(self, pc, num):
@@ -742,7 +748,8 @@ class NuScenesTest(data.Dataset):
         points = self.annotations_points[idx]
         label = self.labels[idx]
         label_name = self.labels_name[idx]
-        
+        box = self.boxes[idx]
+        b_points = points.copy()
         if points.shape[0] < self.npoints:
             points = self._pad_points(points, self.npoints)
         if self.uniform and self.npoints < points.shape[0]:
@@ -751,8 +758,32 @@ class NuScenesTest(data.Dataset):
 
         points = torch.from_numpy(points).float()
 
+        if idx < 20:
+            fig = plt.figure(figsize=(12, 6))
+            
+                 
+            ax2 = fig.add_subplot(121, projection='3d')
+    
+            ax2.scatter(points[:, 0], points[:, 1], points[:, 2], s=5)        
+            
+            ax2.set_xlabel('X')
+            ax2.set_ylabel('Y')
+            ax2.set_zlabel('Z')
+            
+            ax3 = fig.add_subplot(122, projection='3d')
+            ax3.scatter(b_points[:, 0], b_points[:, 1], b_points[:, 2], s=5)     
+            for corner in box.corners().T:
+                ax3.scatter(corner[0], corner[1], corner[2], color='red', s=25)   
+            output_path = f"visualization_test_{idx}.png"
+            plt.tight_layout()
+            plt.savefig(output_path)
+            plt.close()
+        tokenized_captions = []
+        tokenized_captions.append(self.tokenizer(label_name))
+        tokenized_captions = torch.stack(tokenized_captions)
+            
 
-        return points, label, label_name
+        return points, label, label_name, tokenized_captions
 
     def __len__(self):
         return len(self.annotations_points)
@@ -764,6 +795,314 @@ from nuscenes import NuScenesExplorer
 
 @DATASETS.register_module()
 class NuScenesCropDataset(data.Dataset):
+    def __init__(self, config):
+        self.data_root = config.DATA_PATH
+        self.version = "v1.0-mini"
+        self.subset = config.subset
+        self.npoints = config.npoints
+        self.tokenizer = config.tokenizer if hasattr(config, 'tokenizer') else None
+        self.train_transform = config.train_transform
+        self.ratio = config.ratio
+        self.cam_name = 'CAM_FRONT'  # e.g. 'CAM_FRONT'
+        
+        # Initialize nuScenes
+        self.nusc = NuScenes(version=self.version, dataroot=self.data_root, verbose=True)
+        
+        # Create mapping from category to text and index
+        self.category_to_text = {}
+        self.category_to_index = {}
+        for idx, category in enumerate(self.nusc.category):
+            self.category_to_text[category['name']] = category['description']
+            self.category_to_index[category['name']] = idx
+
+        # Collect all annotations for the subset
+        self.annotations = []
+        self.class_dist = {}
+        common = 0
+        self.points = []
+        for sample in self.nusc.sample:
+            self.camera_channels = [chan for chan in sample['data'].keys() if chan.startswith('CAM_')]
+            # if self.subset in sample['token']:  # Simple subset filtering
+            for ann_token in sample['anns']:
+                ann = self.nusc.get('sample_annotation', ann_token)
+                category_name = ann['category_name']
+                caption = category_name.split('.')[1]
+                if caption not in self.class_dist:
+                    self.class_dist[caption] = 1
+                else:
+                    self.class_dist[caption] += 1
+                common += 1
+                # if not ann['category_name'].startswith('vehicle.car'):
+                #     continue
+                
+                # sample = self.nusc.get('sample', ann['sample_token'])
+                f = False
+                for cam_channel in self.camera_channels:
+                    cam_token = sample['data'][cam_channel]
+                    _, boxes, _ = self.nusc.get_sample_data(cam_token, selected_anntokens=[ann_token])
+                    if boxes:
+                        f = True
+                        break
+                if not f:
+                    break
+                        
+                
+                # 1. Get and crop point cloud for this detection
+                lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+                pc = LidarPointCloud.from_file(os.path.join(self.nusc.dataroot, lidar_data['filename']))
+                
+                # Transform points to ego vehicle frame
+                cs_record = self.nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+                pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
+                pc.translate(np.array(cs_record['translation']))
+                
+                # Transform points to global frame
+                poserecord = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+                pc.rotate(Quaternion(poserecord['rotation']).rotation_matrix)
+                pc.translate(np.array(poserecord['translation']))
+                
+                # Create box and get points inside
+                box = Box(ann['translation'], ann['size'], Quaternion(ann['rotation']),
+                        name=ann['category_name'], token=ann['token'])
+                # print("BOX: ", box)
+
+                mask = points_in_box(box, pc.points[:3, :])
+                points = pc.points[:3, mask].T
+                if points.shape[0] > 100:
+                    self.points.append(points)
+                    self.annotations.append(ann_token)
+        
+        print("class_dist:  ", self.class_dist)
+        for a, b in self.class_dist.items():
+            print(a, b/common)
+        # Apply ratio if needed
+        if self.ratio < 1.0:
+            self.annotations = self.annotations[:int(self.ratio * len(self.annotations))]
+        
+        self.permutation = np.arange(self.npoints)
+        self.uniform = config.get('uniform', True)
+        self.augment = config.get('augment', True)
+        self.use_height = config.get('use_height', False)
+
+    def pc_norm(self, pc):
+        centroid = np.mean(pc, axis=0)
+        pc = pc - centroid
+        m = np.max(np.sqrt(np.sum(pc ** 2, axis=1)))
+        if np.isclose(m, 0) or np.isnan(m):
+            # Если все точки совпадают с центром или m=NaN
+            return np.zeros_like(pc)
+        
+        # 4. Безопасная нормализация
+        pc = pc / (m + 1e-10)  # Добавляем малую константу для стабильности
+        return pc
+    
+    def random_sample(self, pc, num):
+        np.random.shuffle(self.permutation)
+        # print("pc:  ", pc.shape)
+        pc = pc[self.permutation[:num]]
+        return pc
+
+    def _pad_points(self, points, target_num):
+        from scipy.interpolate import interpn
+        num_points = points.shape[0]
+        
+        if num_points == 0:
+            return np.random.rand(target_num, 3)
+        
+        # Создаем интерполятор
+        x = np.linspace(0, 1, num_points)
+        x_new = np.linspace(0, 1, target_num)
+        
+        # Интерполируем по каждой оси
+        points_interp = np.zeros((target_num, 3))
+        for i in range(3):
+            points_interp[:, i] = np.interp(x_new, x, points[:, i])
+        
+        return points_interp
+    
+    def __getitem__(self, idx):
+        p_points = self.points[idx]
+        ann_token = self.annotations[idx]
+        ann = self.nusc.get('sample_annotation', ann_token)
+        sample = self.nusc.get('sample', ann['sample_token'])
+        cam_data = self.nusc.get('sample_data', sample['data'][self.cam_name])
+        img = Image.open(os.path.join(self.nusc.dataroot, cam_data['filename']))
+        full_img = img
+        f_cam_chanel = self.cam_name
+        left = 0
+        top = 0
+        right = 0
+        bottom = 0
+        f_box = None
+        for cam_channel in self.camera_channels:
+            cam_token = sample['data'][cam_channel]
+            f_cam_chanel = cam_channel
+            cam_data = self.nusc.get('sample_data', cam_token)
+            img = Image.open(os.path.join(self.nusc.dataroot, cam_data['filename']))
+            full_img = img
+            _, boxes, _ = self.nusc.get_sample_data(cam_token, selected_anntokens=[ann_token])
+            if boxes:
+                box = boxes[0]
+                f_box = box
+                try:
+                    cam_data = self.nusc.get('sample_data', cam_token)
+                    cs_record = self.nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+                    cam_intrinsic = np.array(cs_record['camera_intrinsic'])
+                    
+                    corners_3d = box.corners()
+                    corners_2d = view_points(corners_3d, cam_intrinsic, normalize=True)[:2]
+                    
+                    left = max(0, int(np.floor(corners_2d[0].min())))
+                    right = min(img.width, int(np.ceil(corners_2d[0].max())))
+                    top = max(0, int(np.floor(corners_2d[1].min())))
+                    bottom = min(img.height, int(np.ceil(corners_2d[1].max())))
+                    if right > left and bottom > top:
+                        img =  img.crop((left, top, right, bottom))
+                        break
+                except Exception as e:
+                    print(f"Ошибка при обработке {cam_channel}: {e}")
+                    continue
+        if f_box is  None:
+            print("f_box:   ", f_box, ann['category_name'], idx)
+            img.save("./no_box.jpg")
+                
+        lidar_data = self.nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+        pc = LidarPointCloud.from_file(os.path.join(self.nusc.dataroot, lidar_data['filename']))
+        cs_record = self.nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+        pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix)
+        pc.translate(np.array(cs_record['translation']))
+        poserecord = self.nusc.get('ego_pose', lidar_data['ego_pose_token'])
+        pc.rotate(Quaternion(poserecord['rotation']).rotation_matrix)
+        pc.translate(np.array(poserecord['translation']))
+        pc_lidar = pc.points.copy()
+        sample_record = self.nusc.get('sample', sample['token'])
+        camera_token = sample_record['data'][f_cam_chanel]
+        cam = self.nusc.get('sample_data', camera_token)
+        poserecord = self.nusc.get('ego_pose', cam['ego_pose_token'])
+        pc.translate(-np.array(poserecord['translation']))
+        pc.rotate(Quaternion(poserecord['rotation']).rotation_matrix.T)
+        cs_record = self.nusc.get('calibrated_sensor', cam['calibrated_sensor_token'])
+        pc.translate(-np.array(cs_record['translation']))
+        pc.rotate(Quaternion(cs_record['rotation']).rotation_matrix.T)
+
+        mask = points_in_box(f_box, pc.points[:3, :])
+        points_in_box1 = pc.points[:3, mask].T
+        points = points_in_box1.copy()
+        
+        if p_points.shape[0] == 0:
+            size = np.array(ann['size'])
+            translation = np.array(ann['translation'])
+            points = np.random.rand(self.npoints, 3) * size + translation - size/2
+        elif p_points.shape[0] < self.npoints:
+            points = self._pad_points(p_points, self.npoints)
+        if self.uniform and self.npoints < p_points.shape[0]:
+            points = farthest_point_sample(p_points, self.npoints)
+        points = self.pc_norm(points)
+
+        if self.augment:
+            points = random_point_dropout(points[None, ...])
+            points = random_scale_point_cloud(points)
+            points = shift_point_cloud(points)
+            points = rotate_perturbation_point_cloud(points)
+            points = rotate_point_cloud(points)
+            points = points.squeeze()
+        points = torch.from_numpy(points).float()
+
+
+        
+        if idx < 20:
+            fig = plt.figure(figsize=(12, 6))
+            
+            ax1 = fig.add_subplot(131)
+            ax1.imshow(full_img)
+
+            rect = patches.Rectangle((left, top), right - left, bottom - top, linewidth=1, edgecolor='r', facecolor='none')
+            ax1.add_patch(rect)
+            
+            # output_path1 = f"visualizationD_{idx}.png"
+            # self.nusc.render_pointcloud_in_image(sample['token'], pointsensor_channel='LIDAR_TOP', camera_channel=f_cam_chanel
+            #                                      , out_path=output_path1, filter_lidarseg_labels=[24])
+
+            points3 = view_points(points_in_box1.T, np.array(cs_record['camera_intrinsic']), normalize=True)
+            
+            rect_left, rect_top = rect.get_xy()
+            rect_width = rect.get_width()
+            rect_height = rect.get_height()
+            rect_right = rect_left + rect_width
+            rect_bottom = rect_top + rect_height
+            mask = (
+                (points3[0] >= rect_left) & 
+                (points3[0] <= rect_right) & 
+                (points3[1] >= rect_top) & 
+                (points3[1] <= rect_bottom)
+            )
+
+            filtered_points_2d = points3[:, mask]
+            
+            img_array = np.array(full_img)
+            
+            
+            
+            colors = []
+            for i in range(filtered_points_2d.shape[1]):
+                x, y = int(round(filtered_points_2d[0, i])), int(round(filtered_points_2d[1, i]))
+                if 0 <= x < img_array.shape[1] and 0 <= y < img_array.shape[0]:
+                    colors.append(img_array[y, x])  # OpenCV использует порядок (y,x)
+                else:
+                    colors.append([0, 0, 0])  # Черный для точек вне изображения
+
+            colors = np.array(colors) / 255.0  # Нормализуем в [0,1] для matplotlib
+            
+            
+
+            ax1.scatter(filtered_points_2d[0], filtered_points_2d[1], c=points_in_box1[mask, 2], s=5)
+            ax2 = fig.add_subplot(132, projection='3d')
+    
+            ax2.scatter(points_in_box1[mask, 0], points_in_box1[mask, 1], points_in_box1[mask, 2], c=colors, s=5)        
+            for corner in f_box.corners().T:
+                ax2.scatter(corner[0], corner[1], corner[2], color='red', s=25)
+            
+            ax2.set_xlabel('X')
+            ax2.set_ylabel('Y')
+            ax2.set_zlabel('Z')
+            
+            ax3 = fig.add_subplot(133, projection='3d')
+            ax3.scatter(points[:, 0], points[:, 1], points[:, 2], s=5)        
+            category_name = ann['category_name']
+            text = self.category_to_text.get(category_name, category_name)
+            ax3.set_title(text)   
+                         
+            output_path = f"visualization_{idx}.png"
+            plt.tight_layout()
+            plt.savefig(output_path)
+            plt.close()
+            
+            # print(f"Визуализация {idx} сохранена в {output_path}")
+            label = torch.tensor(self.category_to_index[category_name])
+            # print("All: ", idx, text, label)
+                
+                
+        img = self.train_transform(img)
+
+        # Get text and label
+        category_name = ann['category_name']
+        caption = category_name.split('.')[1]
+        tokenized_captions = []
+        tokenized_captions.append(self.tokenizer(caption))
+        tokenized_captions = torch.stack(tokenized_captions)
+        
+        # print("tokenized_captions:  ", tokenized_captions.shape, tokenized_captions)
+
+        label = torch.tensor(self.category_to_index[category_name])
+        
+
+        return sample['token'], ann['instance_token'], tokenized_captions, points, img, label
+
+    def __len__(self):
+        return len(self.annotations)
+    
+@DATASETS.register_module()
+class NuScenesCropDatasetTest(data.Dataset):
     def __init__(self, config):
         self.data_root = config.DATA_PATH
         self.version = "v1.0-mini"
@@ -844,7 +1183,7 @@ class NuScenesCropDataset(data.Dataset):
             print(a, b/common)
         # Apply ratio if needed
         if self.ratio < 1.0:
-            self.annotations = self.annotations[:int(self.ratio * len(self.annotations))]
+            self.annotations = self.annotations[-1 * int(0.1 * len(self.annotations)):]
         
         self.permutation = np.arange(self.npoints)
         self.uniform = config.get('uniform', True)
@@ -862,7 +1201,7 @@ class NuScenesCropDataset(data.Dataset):
         # 4. Безопасная нормализация
         pc = pc / (m + 1e-10)  # Добавляем малую константу для стабильности
         return pc
-
+    
     def random_sample(self, pc, num):
         np.random.shuffle(self.permutation)
         # print("pc:  ", pc.shape)
@@ -965,90 +1304,88 @@ class NuScenesCropDataset(data.Dataset):
             points = farthest_point_sample(points, self.npoints)
         points = self.pc_norm(points)
 
-        if self.augment:
-            points = random_point_dropout(points[None, ...])
-            points = random_scale_point_cloud(points)
-            points = shift_point_cloud(points)
-            points = rotate_perturbation_point_cloud(points)
-            points = rotate_point_cloud(points)
-            points = points.squeeze()
+        # if self.augment:
+        #     points = random_point_dropout(points[None, ...])
+        #     points = random_scale_point_cloud(points)
+        #     points = shift_point_cloud(points)
+        #     points = rotate_perturbation_point_cloud(points)
+        #     points = rotate_point_cloud(points)
+        #     points = points.squeeze()
         points = torch.from_numpy(points).float()
 
 
         
-        # if idx < 20:
-        #     fig = plt.figure(figsize=(12, 6))
+        if idx < 20:
+            fig = plt.figure(figsize=(12, 6))
             
-        #     ax1 = fig.add_subplot(131)
-        #     ax1.imshow(full_img)
+            ax1 = fig.add_subplot(131)
+            ax1.imshow(full_img)
 
-        #     rect = patches.Rectangle((left, top), right - left, bottom - top, linewidth=1, edgecolor='r', facecolor='none')
-        #     ax1.add_patch(rect)
+            rect = patches.Rectangle((left, top), right - left, bottom - top, linewidth=1, edgecolor='r', facecolor='none')
+            ax1.add_patch(rect)
             
-        #     # output_path1 = f"visualizationD_{idx}.png"
-        #     # self.nusc.render_pointcloud_in_image(sample['token'], pointsensor_channel='LIDAR_TOP', camera_channel=f_cam_chanel
-        #     #                                      , out_path=output_path1, filter_lidarseg_labels=[24])
+            # output_path1 = f"visualizationD_{idx}.png"
+            # self.nusc.render_pointcloud_in_image(sample['token'], pointsensor_channel='LIDAR_TOP', camera_channel=f_cam_chanel
+            #                                      , out_path=output_path1, filter_lidarseg_labels=[24])
 
-        #     points3 = view_points(points_in_box1.T, np.array(cs_record['camera_intrinsic']), normalize=True)
+            points3 = view_points(points_in_box1.T, np.array(cs_record['camera_intrinsic']), normalize=True)
             
-        #     rect_left, rect_top = rect.get_xy()
-        #     rect_width = rect.get_width()
-        #     rect_height = rect.get_height()
-        #     rect_right = rect_left + rect_width
-        #     rect_bottom = rect_top + rect_height
-        #     mask = (
-        #         (points3[0] >= rect_left) & 
-        #         (points3[0] <= rect_right) & 
-        #         (points3[1] >= rect_top) & 
-        #         (points3[1] <= rect_bottom)
-        #     )
+            rect_left, rect_top = rect.get_xy()
+            rect_width = rect.get_width()
+            rect_height = rect.get_height()
+            rect_right = rect_left + rect_width
+            rect_bottom = rect_top + rect_height
+            mask = (
+                (points3[0] >= rect_left) & 
+                (points3[0] <= rect_right) & 
+                (points3[1] >= rect_top) & 
+                (points3[1] <= rect_bottom)
+            )
 
-        #     filtered_points_2d = points3[:, mask]
+            filtered_points_2d = points3[:, mask]
             
-        #     img_array = np.array(full_img)
+            img_array = np.array(full_img)
             
             
             
-        #     colors = []
-        #     for i in range(filtered_points_2d.shape[1]):
-        #         x, y = int(round(filtered_points_2d[0, i])), int(round(filtered_points_2d[1, i]))
-        #         if 0 <= x < img_array.shape[1] and 0 <= y < img_array.shape[0]:
-        #             colors.append(img_array[y, x])  # OpenCV использует порядок (y,x)
-        #         else:
-        #             colors.append([0, 0, 0])  # Черный для точек вне изображения
+            colors = []
+            for i in range(filtered_points_2d.shape[1]):
+                x, y = int(round(filtered_points_2d[0, i])), int(round(filtered_points_2d[1, i]))
+                if 0 <= x < img_array.shape[1] and 0 <= y < img_array.shape[0]:
+                    colors.append(img_array[y, x])  # OpenCV использует порядок (y,x)
+                else:
+                    colors.append([0, 0, 0])  # Черный для точек вне изображения
 
-        #     colors = np.array(colors) / 255.0  # Нормализуем в [0,1] для matplotlib
+            colors = np.array(colors) / 255.0  # Нормализуем в [0,1] для matplotlib
             
             
 
-        #     ax1.scatter(filtered_points_2d[0], filtered_points_2d[1], c=points_in_box1[mask, 2], s=5)
-        #     ax2 = fig.add_subplot(132, projection='3d')
+            ax1.scatter(filtered_points_2d[0], filtered_points_2d[1], c=points_in_box1[mask, 2], s=5)
+            ax2 = fig.add_subplot(132, projection='3d')
     
-        #     ax2.scatter(points_in_box1[mask, 0], points_in_box1[mask, 1], points_in_box1[mask, 2], c=colors, s=5)        
-        #     for corner in f_box.corners().T:
-        #         ax2.scatter(corner[0], corner[1], corner[2], color='red', s=25)
+            ax2.scatter(points_in_box1[mask, 0], points_in_box1[mask, 1], points_in_box1[mask, 2], c=colors, s=5)        
+            for corner in f_box.corners().T:
+                ax2.scatter(corner[0], corner[1], corner[2], color='red', s=25)
             
-        #     ax2.set_xlabel('X')
-        #     ax2.set_ylabel('Y')
-        #     ax2.set_zlabel('Z')
+            ax2.set_xlabel('X')
+            ax2.set_ylabel('Y')
+            ax2.set_zlabel('Z')
             
-        #     ax3 = fig.add_subplot(133, projection='3d')
-        #     ax3.scatter(points[:, 0], points[:, 1], points[:, 2], s=5)        
-        #     category_name = ann['category_name']
-        #     text = self.category_to_text.get(category_name, category_name)
-        #     ax3.set_title(text)   
+            ax3 = fig.add_subplot(133, projection='3d')
+            ax3.scatter(points[:, 0], points[:, 1], points[:, 2], s=5)        
+            category_name = ann['category_name']
+            text = self.category_to_text.get(category_name, category_name)
+            ax3.set_title(text)   
                          
-        #     output_path = f"visualization_{idx}.png"
-        #     plt.tight_layout()
-        #     plt.savefig(output_path)
-        #     plt.close()
+            output_path = f"visualization_{idx}.png"
+            plt.tight_layout()
+            plt.savefig(output_path)
+            plt.close()
             
-        #     # print(f"Визуализация {idx} сохранена в {output_path}")
-        #     label = torch.tensor(self.category_to_index[category_name])
-        #     # print("All: ", idx, text, label)
+            # print(f"Визуализация {idx} сохранена в {output_path}")
+            label = torch.tensor(self.category_to_index[category_name])
+            # print("All: ", idx, text, label)
                 
-                
-        img = self.train_transform(img)
 
         # Get text and label
         category_name = ann['category_name']
@@ -1057,20 +1394,13 @@ class NuScenesCropDataset(data.Dataset):
         tokenized_captions.append(self.tokenizer(caption))
         tokenized_captions = torch.stack(tokenized_captions)
         
-        text = self.category_to_text.get(category_name, category_name)
-        if self.tokenizer is not None:
-            tokenized_text = self.tokenizer(text)
-            tokenized_text = torch.stack([tokenized_text])
-        else:
-            tokenized_text = text
+        # print("tokenized_captions:  ", tokenized_captions.shape, tokenized_captions)
+
         label = torch.tensor(self.category_to_index[category_name])
         
-        # if idx < 20:
-        #     print("category_name:    ", category_name)
-        #     print("text:    ", text)
-        #     print("caption:    ", caption)
+        return points, label, caption, tokenized_captions
 
-        return sample['token'], ann['instance_token'], tokenized_captions, points, img, label
+        # return points, label, tokenized_captions
 
     def __len__(self):
         return len(self.annotations)
