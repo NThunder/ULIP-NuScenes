@@ -1,0 +1,4 @@
+NAME: NuScenesCropDataset
+DATA_PATH: data/sets/mini/
+N_POINTS: 8192
+ratio: 0.9
